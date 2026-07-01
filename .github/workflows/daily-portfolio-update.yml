@@ -1,0 +1,82 @@
+name: Daily Portfolio Update
+
+# Runs once a day, right after market close, on weekdays:
+#   1. Process any new/updated transactions into Holdings
+#   2. Refresh Current Price for every holding (including ones just created
+#      in step 1), using that day's close
+#
+# 4:00 PM ET is 20:00 UTC during Eastern Daylight Time and 21:00 UTC during
+# Eastern Standard Time. Cron can't shift for DST on its own, so both
+# schedules are registered below, and the "Check if within target window"
+# step figures out which one is the real firing for today's season and
+# skips the other — so you still only get one run per day either way.
+on:
+  schedule:
+    - cron: "5 20 * * 1-5"   # ~4:05 PM ET during EDT, ~3:05 PM during EST
+    - cron: "5 21 * * 1-5"   # ~4:05 PM ET during EST, ~5:05 PM during EDT
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # needed to commit the updated transaction-processing state file
+
+concurrency:
+  group: daily-portfolio-update
+  cancel-in-progress: false
+
+jobs:
+  update-portfolio:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Check if within target window (4 PM ET)
+        id: check_time
+        run: |
+          HOUR=$(TZ="America/New_York" date +%H)
+          MIN=$(TZ="America/New_York" date +%M)
+          if [ "${{ github.event_name }}" = "schedule" ] && { [ "$HOUR" != "16" ] || [ "$MIN" -ge "20" ]; }; then
+            echo "Not the correct seasonal firing (current ET time: $HOUR:$MIN). Skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Within target window (or manually triggered). Proceeding."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.check_time.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        if: steps.check_time.outputs.run == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Process transactions (create/update holdings)
+        if: steps.check_time.outputs.run == 'true'
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_HOLDINGS_DATA_SOURCE_ID: ${{ secrets.NOTION_HOLDINGS_DATA_SOURCE_ID }}
+          NOTION_TRANSACTIONS_DATA_SOURCE_ID: ${{ secrets.NOTION_TRANSACTIONS_DATA_SOURCE_ID }}
+        run: python scripts/process_transactions.py
+
+      - name: Commit updated state file
+        if: steps.check_time.outputs.run == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/processed_transactions.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update processed transactions state [skip ci]"
+            git push
+          else
+            echo "No state changes to commit."
+          fi
+
+      - name: Update current prices (today's close)
+        if: steps.check_time.outputs.run == 'true'
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_HOLDINGS_DATA_SOURCE_ID: ${{ secrets.NOTION_HOLDINGS_DATA_SOURCE_ID }}
+        run: python scripts/update_prices.py
